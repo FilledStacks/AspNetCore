@@ -44,7 +44,11 @@ export class HubConnection {
     private receivedHandshakeResponse: boolean;
     private handshakeResolver!: (value?: PromiseLike<{}>) => void;
     private handshakeRejecter!: (reason?: any) => void;
+    private stopDuringStartError?: Error;
     private connectionState: HubConnectionState;
+    // connectionStarted is tracked independently from connectionState, so we can check if the
+    // connection ever did successfully transition from connecting to connected before disconnecting.
+    private connectionStarted: boolean;
 
     private stopPromise?: Promise<void>;
     // The type of the handle a) doesn't matter and b) varies when building in browser and node contexts
@@ -104,6 +108,7 @@ export class HubConnection {
         this.invocationId = 0;
         this.receivedHandshakeResponse = false;
         this.connectionState = HubConnectionState.Disconnected;
+        this.connectionStarted = false;
 
         this.cachedPingMessage = this.protocol.writeMessage({ type: MessageType.Ping });
     }
@@ -128,10 +133,23 @@ export class HubConnection {
         try {
             await this.startInternal();
 
+            if (this.connectionState !== HubConnectionState.Connecting) {
+                const defaultMessage = "The underlying connection stopped between the handshake completing and start() completing.";
+                const error = this.stopDuringStartError || new Error(defaultMessage);
+                this.stopDuringStartError = undefined;
+
+                this.logger.log(LogLevel.Error, error.message);
+                return Promise.reject(error);
+            }
+
             this.connectionState = HubConnectionState.Connected;
+            this.connectionStarted = true;
             this.logger.log(LogLevel.Debug, "HubConnection connected successfully.");
         } catch (e) {
-            this.connectionState = HubConnectionState.Disconnected;
+            if (this.connectionState === HubConnectionState.Connecting) {
+                this.connectionState = HubConnectionState.Disconnected;
+            }
+
             this.logger.log(LogLevel.Debug, `HubConnection failed to start successfully because of error '${e}'.`);
             return Promise.reject(e);
         }
@@ -591,18 +609,13 @@ export class HubConnection {
         this.cleanupTimeout();
         this.cleanupPingTimer();
 
-        if (this.connectionState === HubConnectionState.Disconnecting) {
+        if (this.connectionState === HubConnectionState.Connecting || this.connectionState === HubConnectionState.Disconnecting) {
             this.completeClose(error);
         } else if (this.connectionState === HubConnectionState.Connected && this.reconnectPolicy) {
             // tslint:disable-next-line:no-floating-promises
             this.reconnect(error);
         } else if (this.connectionState === HubConnectionState.Connected) {
             this.completeClose(error);
-        } else if (this.connectionState === HubConnectionState.Connecting) {
-            // The handshakeRejecter will fail start(). Don't trigger any onclose callbacks.
-            // Still, transition back to the Disconnected before completing the HttpConnection.onclose
-            // callback and thereby also HubConnection.start() method.
-            this.connectionState = HubConnectionState.Disconnected;
         }
 
         // If none of the above if conditions were true were called the HubConnection must be in either:
@@ -614,10 +627,18 @@ export class HubConnection {
     private completeClose(error?: Error) {
         this.connectionState = HubConnectionState.Disconnected;
 
-        try {
-            this.closedCallbacks.forEach((c) => c.apply(this, [error]));
-        } catch (e) {
-            this.logger.log(LogLevel.Error, `An onclose callback called with error '${error}' threw error '${e}'.`);
+        if (this.connectionStarted) {
+            this.connectionStarted = false;
+
+            try {
+                this.closedCallbacks.forEach((c) => c.apply(this, [error]));
+            } catch (e) {
+                this.logger.log(LogLevel.Error, `An onclose callback called with error '${error}' threw error '${e}'.`);
+            }
+        } else {
+            // The handshakeRejecter will fail start(). Don't trigger any onclose callbacks.
+            // Transitioning to the Disconnected state ensures start still will fail even if the handshake completed, but start did not.
+            this.stopDuringStartError = error;
         }
     }
 
@@ -670,6 +691,11 @@ export class HubConnection {
 
             try {
                 await this.startInternal();
+
+                if (this.connectionState !== HubConnectionState.Reconnecting) {
+                    this.logger.log(LogLevel.Debug, "Connection left the reconnecting state between the reconnect handshake completing and transitioning back to the connected state.");
+                    return;
+                }
 
                 this.connectionState = HubConnectionState.Connected;
                 this.logger.log(LogLevel.Information, "HubConnection reconnected successfully.");
